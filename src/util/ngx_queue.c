@@ -84,7 +84,7 @@ ngx_queue_insert_in_ascending_order(ngx_queue_t *h, ngx_queue_t *x,
     ngx_queue_t  *q;
 
     if (ngx_queue_empty(h)) {
-        ngx_queue_insert_head(h, x);
+        ngx_queue_insert_after(h, x);
         return;
     }
 
@@ -93,10 +93,9 @@ ngx_queue_insert_in_ascending_order(ngx_queue_t *h, ngx_queue_t *x,
          q = ngx_queue_prev(q))
     {
         if (cmp(x, q) >= 0) {
-            ngx_queue_insert_after(q, x);
-            return;
+            break;
         }
     }
 
-    ngx_queue_insert_head(h, x);
+    ngx_queue_insert_after(q, x);
 }

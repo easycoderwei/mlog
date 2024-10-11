@@ -4,9 +4,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include "utils/hash.h"
-#include "utils/kfifo.h"
-#include "utils/ngx_queue.h"
+#include "util/hash.h"
+#include "util/kfifo.h"
+#include "util/ngx_queue.h"
 #include "mlog_inner.h"
 
 
@@ -21,7 +21,7 @@ typedef struct {
     hash_link                  hlnk;
     pid_t                      pid;
     pid_t                      tid;
-    struct kfifo              *fifo_buf;
+    struct kfifo              *kfifo_buf;
     mlog_atomic_t              refer;
 } mlog_thread_local_data_t;
 
@@ -50,15 +50,17 @@ typedef struct {
     unsigned int               free_count;
     pthread_cond_t             cond;
     pthread_mutex_t            mutex;
-    volatile int               exit;
+    volatile int               active;
 } mlog_async_job_t;
 
 
 static void mlog_destroy_pkey();
 static mlog_thread_local_data_t *mlog_get_thread_data();
+static inline void mlog_release_free_list();
+static void mlog_do_write_log(ngx_queue_t *task_list, int active);
 static inline mlog_atomic_t mlog_increase_refer(mlog_thread_local_data_t *data);
 static inline mlog_atomic_t mlog_decrease_refer(mlog_thread_local_data_t *data);
-static void mlog_decrease_refer_and_check(mlog_thread_local_data_t *data);
+static void mlog_decrease_refer_and_try_release(mlog_thread_local_data_t *data);
 
 
 static pthread_key_t           mlog_pkey;
@@ -71,8 +73,8 @@ mlog_constructor()
 {
     MLOG_DEBUG("constructor");
     pthread_key_create(&mlog_pkey, mlog_destroy_pkey);
+    async_job.active = 0;
     async_job.free_count = 0;
-    async_job.exit = 0;
     ngx_queue_init(&async_job.task_list);
     ngx_queue_init(&async_job.free_list);
     pthread_mutex_init(&async_job.mutex, NULL);
@@ -142,14 +144,14 @@ mlog_post_log_task(unsigned long msec, unsigned char *buf, unsigned int len)
         return -1;
     }
 
-    remain_len = thread_data.kfifo_buf_size - kfifo_len(data->fifo_buf);
+    remain_len = thread_data.kfifo_buf_size - kfifo_len(data->kfifo_buf);
     if (remain_len < len) {
         MLOG_ERROR("fifo buf not enough, msg_len=%u remain=%u",
                    len, remain_len);
         return - 1;
     }
 
-    wlen = kfifo_put(data->fifo_buf, buf, len);
+    wlen = kfifo_put(data->kfifo_buf, buf, len);
 
     old_refer = mlog_increase_refer(data);
 
@@ -169,9 +171,12 @@ mlog_post_log_task(unsigned long msec, unsigned char *buf, unsigned int len)
     } else {
         q = ngx_queue_head(&async_job.free_list);
         ngx_queue_remove(q);
-        async_job.free_count--;
 
         task = ngx_queue_data(q, mlog_task_t, q);
+
+        async_job.free_count--;
+
+        MLOG_DEBUG("remove node from free_list count=%d", async_job.free_count);
     }
 
     task->msec = msec;
@@ -196,21 +201,17 @@ static void *
 mlog_async_write_log(void *arg)
 {
     int              ret;
-    pid_t            tid;
-    ssize_t          wlen;
-    ngx_queue_t     *q, *next;
+    ngx_queue_t     *q, tasks;
     mlog_task_t     *task;
-    unsigned int     len;
-    unsigned char    buf[MLOG_MAX_LOG_LEN];
 
     MLOG_DEBUG("start async job ...");
 
     for (;;) {
+        ngx_queue_init(&tasks);
+
         pthread_mutex_lock(&async_job.mutex);
 
-        while (ngx_queue_empty(&async_job.task_list)
-               && !async_job.exit)
-        {
+        while (ngx_queue_empty(&async_job.task_list) && async_job.active) {
             MLOG_DEBUG("pthread_cond_wait");
             ret = pthread_cond_wait(&async_job.cond, &async_job.mutex);
             if (ret != 0) {
@@ -220,59 +221,21 @@ mlog_async_write_log(void *arg)
 
         MLOG_DEBUG("recv cond signal");
 
-        for (q = ngx_queue_head(&async_job.task_list);
-             q != ngx_queue_sentinel(&async_job.task_list);
-             q = next)
-        {
-            next = ngx_queue_next(q);
-
-            ngx_queue_remove(q);
-            task = ngx_queue_data(q, mlog_task_t, q);
-
-            tid = task->data->tid;
-
-            len = kfifo_get(task->data->fifo_buf, buf, task->msg_len);
-
-            wlen = write(async_job.fd, buf, len);
-
-            MLOG_DEBUG("task tid=%d msg_len=%d wlen=%ld",
-                       tid, task->msg_len, wlen);
-
-            mlog_decrease_refer_and_check(task->data);
-
-            if (async_job.free_count < MLOG_MAX_FREE_LIST_SIZE) {
-                async_job.free_count++;
-                ngx_queue_insert_tail(&async_job.free_list, q);
-
-            } else {
-                free(task);
-            }
-
-            if (wlen < 0 || wlen < len) {
-                /* TODO: save data to retry list if write failed */
-                MLOG_ERROR("task tid=%d write log failed len=%d wlen=%ld",
-                           tid, len, wlen);
-                break;
-            }
-        }
-
-        if (async_job.exit) {
-            MLOG_DEBUG("recv exit signal");
-            for (q = ngx_queue_head(&async_job.free_list);
-                 q != ngx_queue_sentinel(&async_job.free_list);
-                 q = next)
-            {
-                next = ngx_queue_next(q);
-                ngx_queue_remove(q);
-                free(q);
-            }
-            async_job.free_count = 0;
-
-            pthread_mutex_unlock(&async_job.mutex);
-            break;
+        if (!ngx_queue_empty(&async_job.task_list)) {
+            q = ngx_queue_head(&async_job.task_list);
+            ngx_queue_split(&async_job.task_list, q, &tasks);
         }
 
         pthread_mutex_unlock(&async_job.mutex);
+
+        if (!ngx_queue_empty(&tasks)) {
+            mlog_do_write_log(&tasks, async_job.active);
+        }
+
+        if (!async_job.active) {
+            mlog_release_free_list();
+            break;
+        }
     }
 
     if (async_job.fd >= 0) {
@@ -281,6 +244,129 @@ mlog_async_write_log(void *arg)
     }
 
     MLOG_DEBUG("exit async job !!!");
+}
+
+
+static inline void
+mlog_release_free_list()
+{
+    ngx_queue_t    *q, *next;
+    mlog_task_t    *task;
+
+    MLOG_DEBUG("recv exit signal");
+
+    pthread_mutex_lock(&async_job.mutex);
+
+    for (q = ngx_queue_head(&async_job.free_list);
+         q != ngx_queue_sentinel(&async_job.free_list);
+         q = next)
+    {
+        next = ngx_queue_next(q);
+        ngx_queue_remove(q);
+
+        task = ngx_queue_data(q, mlog_task_t, q);
+        free(task);
+
+        MLOG_DEBUG("release free_list item");
+    }
+
+    async_job.free_count = 0;
+
+    pthread_mutex_unlock(&async_job.mutex);
+}
+
+
+static inline void
+mlog_try_reuse_and_check_release(ngx_queue_t *free_tasks)
+{
+    ngx_queue_t    *q, *next;
+    mlog_task_t    *task;
+
+    pthread_mutex_lock(&async_job.mutex);
+
+    for (q = ngx_queue_head(free_tasks);
+         async_job.free_count < MLOG_MAX_FREE_LIST_SIZE
+         && q != ngx_queue_sentinel(free_tasks);
+         q = next)
+    {
+        next = ngx_queue_next(q);
+        ngx_queue_remove(q);
+
+        ngx_queue_insert_tail(&async_job.free_list, q);
+        async_job.free_count++;
+
+        MLOG_DEBUG("add node to free_list count=%d", async_job.free_count);
+    }
+
+    pthread_mutex_unlock(&async_job.mutex);
+
+    for (q = ngx_queue_head(free_tasks);
+         q != ngx_queue_sentinel(free_tasks);
+         q = next)
+    {
+        next = ngx_queue_next(q);
+        ngx_queue_remove(q);
+
+        task = ngx_queue_data(q, mlog_task_t, q);
+        free(task);
+
+        MLOG_DEBUG("release redundant task");
+    }
+}
+
+
+static void
+mlog_do_write_log(ngx_queue_t *task_list, int active)
+{
+    pid_t                        tid;
+    ssize_t                      wlen;
+    mlog_task_t                 *task;
+    ngx_queue_t                 *q, *next, free_tasks;
+    unsigned int                 len;
+    unsigned char                buf[MLOG_MAX_LOG_LEN];
+    mlog_thread_local_data_t    *data;
+
+    ngx_queue_init(&free_tasks);
+
+    for (q = ngx_queue_head(task_list);
+         q != ngx_queue_sentinel(task_list);
+         q = next)
+    {
+        next = ngx_queue_next(q);
+
+        ngx_queue_remove(q);
+        task = ngx_queue_data(q, mlog_task_t, q);
+
+        data = task->data;
+
+        tid = data->tid;
+
+        len = kfifo_get(data->kfifo_buf, buf, task->msg_len);
+
+        wlen = write(async_job.fd, buf, len);
+
+        MLOG_DEBUG("task tid=%d msg_len=%d wlen=%ld",
+                   tid, task->msg_len, wlen);
+
+        mlog_decrease_refer_and_try_release(data);
+
+        if (active) {
+            ngx_queue_insert_tail(&free_tasks, &task->q);
+        } else {
+            free(task);
+        }
+
+        if (wlen < 0 || wlen < len) {
+            /* TODO: save data to retry list if write failed */
+            MLOG_ERROR("task tid=%d write log failed len=%d wlen=%ld",
+                       tid, len, wlen);
+            break;
+        }
+    }
+
+    if (!ngx_queue_empty(&free_tasks)) {
+        mlog_try_reuse_and_check_release(&free_tasks);
+    }
 }
 
 
@@ -300,8 +386,8 @@ mlog_get_thread_data()
         return NULL;
     }
 
-    data->fifo_buf = kfifo_alloc(thread_data.kfifo_buf_size);
-    if (data->fifo_buf == NULL) {
+    data->kfifo_buf = kfifo_alloc(thread_data.kfifo_buf_size);
+    if (data->kfifo_buf == NULL) {
         MLOG_ERROR("kfifo_alloc failed");
         free(data);
         return NULL;
@@ -340,7 +426,7 @@ mlog_decrease_refer(mlog_thread_local_data_t *data)
 
 
 static void
-mlog_decrease_refer_and_check(mlog_thread_local_data_t *data)
+mlog_decrease_refer_and_try_release(mlog_thread_local_data_t *data)
 {
     mlog_atomic_t  old_refer = mlog_decrease_refer(data);
 
@@ -351,7 +437,7 @@ mlog_decrease_refer_and_check(mlog_thread_local_data_t *data)
         MLOG_DEBUG("clear thread %d data", data->tid);
         pthread_mutex_lock(&thread_data.mutex);
         hash_remove_link(thread_data.table, &data->hlnk);
-        kfifo_free(data->fifo_buf);
+        kfifo_free(data->kfifo_buf);
         free(data);
         pthread_mutex_unlock(&thread_data.mutex);
     }
@@ -386,7 +472,7 @@ mlog_destroy_pkey()
     if (old_refer == 1) {
         MLOG_DEBUG("clear thread %d data", data->tid);
         hash_remove_link(thread_data.table, &data->hlnk);
-        kfifo_free(data->fifo_buf);
+        kfifo_free(data->kfifo_buf);
         free(data);
     }
 
@@ -426,6 +512,11 @@ mlog_inner_init(const char *filename, unsigned int buf_size)
 {
     int ret;
 
+    if (buf_size & (buf_size - 1)) {
+        MLOG_ERROR("buf_size must be 2^n, invalid %d", buf_size);
+        goto _fail;
+    }
+
     thread_data.table = hash_create(mlog_tid_hash_cmp, 103, mlog_tid_hash);
     if (thread_data.table == NULL) {
         MLOG_ERROR("create thread_data failed");
@@ -441,6 +532,7 @@ mlog_inner_init(const char *filename, unsigned int buf_size)
     }
 
     async_job.filename = filename;
+    async_job.active = 1;
 
     ret = pthread_create(&async_job.tid, NULL, mlog_async_write_log, NULL);
     if (ret != 0) {
@@ -461,6 +553,8 @@ _fail:
         async_job.fd = -1;
     }
 
+    async_job.active = 0;
+
     return -1;
 }
 
@@ -468,7 +562,7 @@ _fail:
 void
 mlog_inner_uinit()
 {
-    async_job.exit = 1;
+    async_job.active = 0;
 
     __sync_synchronize();
 
